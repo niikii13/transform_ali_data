@@ -262,94 +262,103 @@
       const rowsResult = [];
       const recognizedModels = new Set();
       const recognizedSkus = new Set();
+      const emptyModels = [];          // модели, для которых не нашлось данных
+      const usedStockRows = new Set(); // строки "ключ-значение" моделей без цвета (не считать их заголовком размеров)
+
+      // Заголовок размера: 42, 44 ... либо диапазон вида 42-44
+      const isSize = v => v !== null && /^\d{2,3}(\s*-\s*\d{2,3})?$/.test(String(v).trim());
+
+      // Читает подряд идущие ячейки вправо от модели в указанной строке
+      function readRight(r, c0, onlySizes) {
+        const out = [];
+        let c = c0 + 1;
+        while (c < maxCols) {
+          const val = getVal(r, c);
+          if (val === null || String(val).trim() === '') break;
+          if (onlySizes && !isSize(val)) break;
+          out.push({ col: c, size: String(val).trim() });
+          c++;
+        }
+        return out;
+      }
+
+      function pushRow(model, color, skuBody, sc, stockVal) {
+        let numStock = 0;
+        if (stockVal !== null && stockVal !== undefined && stockVal !== '') {
+          const parsed = parseFloat(stockVal);
+          numStock = isNaN(parsed) ? 0 : Math.round(parsed);
+        }
+        rowsResult.push({
+          model: model,
+          color: color,
+          skuBody: skuBody,
+          size: sc.size,
+          finalSku: `${skuBody}_${sc.size}`,
+          stock: numStock
+        });
+      }
 
       modelCells.forEach(item => {
         const { row, col, model } = item;
-        recognizedModels.add(model);
+        let produced = 0;
 
-        // 1. Поиск строки с размерами
-        // Вариант А: размеры в той же строке правее номера модели (например, 86136)
-        let sizeCols = [];
-        let curC = col + 1;
-        while (curC < maxCols) {
-          const val = getVal(row, curC);
-          if (val !== null && String(val).trim() !== '') {
-            sizeCols.push({ col: curC, size: String(val).trim() });
-          } else {
-            break;
-          }
-          curC++;
+        // --- Вариант В (новый): модель БЕЗ цветов ---
+        // Размеры в строке выше, а остатки лежат в той же строке, что и номер модели.
+        const headerAbove = (row > 0 && !usedStockRows.has(row - 1)) ? readRight(row - 1, col, true) : [];
+        const valuesSame = readRight(row, col, false);
+        if (headerAbove.length > 0 && valuesSame.length > 0) {
+          const skuBody = model;
+          headerAbove.forEach(sc => {
+            pushRow(model, '—', skuBody, sc, getVal(row, sc.col));
+            produced++;
+          });
+          usedStockRows.add(row);
+          recognizedSkus.add(skuBody);
+          recognizedModels.add(model);
+          return;
         }
 
-        // Вариант Б: размеры в строке выше (row - 1)
-        if (sizeCols.length === 0 && row > 0) {
-          curC = col + 1;
-          while (curC < maxCols) {
-            const val = getVal(row - 1, curC);
-            if (val !== null && String(val).trim() !== '') {
-              sizeCols.push({ col: curC, size: String(val).trim() });
-            } else {
-              break;
-            }
-            curC++;
-          }
+        // --- Вариант А: размеры в той же строке правее номера модели (например, 86136) ---
+        let sizeCols = valuesSame;
+
+        // --- Вариант Б: размеры в строке выше (row - 1) ---
+        if (sizeCols.length === 0 && row > 0 && !usedStockRows.has(row - 1)) {
+          sizeCols = headerAbove;
         }
 
-        if (sizeCols.length === 0) return;
+        if (sizeCols.length === 0) { emptyModels.push(model); return; }
 
-        // 2. Считывание строк цветов вниз от строки модели
+        // Считывание строк цветов вниз от строки модели
         let curR = row + 1;
         while (curR < maxRows) {
           const colorCell = getVal(curR, col);
-          if (colorCell === null || String(colorCell).trim() === '') {
-            break;
-          }
+          if (colorCell === null || String(colorCell).trim() === '') break;
           const rawColor = String(colorCell).trim();
-          
+
           // Если встретили другую модель или число - прерываем чтение текущего блока
           if (/^\d{4,}$/.test(rawColor)) break;
 
-          // Определение тела артикула
           const mapKey = `${model}_${rawColor.toLowerCase()}`;
           let skuBody = SKU_MAP[mapKey];
-          
           if (!skuBody) {
             const suffix = DEFAULT_COLOR_SUFFIXES[rawColor.toLowerCase()] || rawColor.toLowerCase();
             skuBody = `${model}${suffix}`;
           }
-
           recognizedSkus.add(skuBody);
 
-          // Считывание остатков по каждому размеру
-          sizeCols.forEach(sc => {
-            let stockVal = getVal(curR, sc.col);
-            let numStock = 0;
-            if (stockVal !== null && stockVal !== undefined && stockVal !== '') {
-              const parsed = parseFloat(stockVal);
-              numStock = isNaN(parsed) ? 0 : Math.round(parsed);
-            }
-
-            const cleanSize = sc.size;
-            const finalSku = `${skuBody}_${cleanSize}`;
-
-            rowsResult.push({
-              model: model,
-              color: rawColor,
-              skuBody: skuBody,
-              size: cleanSize,
-              finalSku: finalSku,
-              stock: numStock
-            });
-          });
-
+          sizeCols.forEach(sc => { pushRow(model, rawColor, skuBody, sc, getVal(curR, sc.col)); produced++; });
           curR++;
         }
+
+        if (produced === 0) emptyModels.push(model);
+        else recognizedModels.add(model);
       });
 
       return {
         rows: rowsResult,
         modelsCount: recognizedModels.size,
-        skusCount: recognizedSkus.size
+        skusCount: recognizedSkus.size,
+        emptyModels: emptyModels
       };
     }
 
@@ -408,7 +417,9 @@
           }
 
           processedRows = parsed.rows;
-          showStatus(`Успешно обработано: найдено ${parsed.modelsCount} моделей, сформировано ${parsed.rows.length} позиций.`);
+          let msg = `Успешно обработано: найдено ${parsed.modelsCount} моделей, сформировано ${parsed.rows.length} позиций.`;
+          if (parsed.emptyModels.length) msg += ` ⚠ Без данных (пропущены): ${parsed.emptyModels.join(', ')}.`;
+          showStatus(msg);
           renderStats(parsed);
           renderTable(processedRows);
           outputSection.classList.remove('hidden');
